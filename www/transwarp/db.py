@@ -79,31 +79,34 @@ class DBError(Exception):
 class MultiColumnsError(DBError):
     pass
 
+# 真正的数据库连接，隶属于_DbCtx()
 class _LasyConnection(object):
     def __init__(self):
         self.connection = None
 
+    # 获取游标对象
     def cursor(self):
         if self.connection is None:
             connection = engine.connect()
             logging.info('open connection <%s>...' % hex(id(connection)))
             self.connection = connection
         return self.connection.cursor()
-
+    # 提交修改
     def commit(self):
         self.connection.commit()
-
+    # 回滚
     def rollback(self):
         self.connection.rollback()
-
+    # 清理、关闭连接
     def cleanup(self):
         if self.connection:
         	# 看来不是简单的赋值？？
             connection = self.connection
             self.connection = None
-            logging.info('close connection <%s>...' % hex(id(connection)))
+            logging.info('close connection <%s>...\n' % hex(id(connection)))
             connection.close()
 
+# 来控制数据库连接的初始化，清扫以及游标的工作
 class _DbCtx(threading.local):
     '''
     Thread local object that holds connection info.
@@ -117,13 +120,14 @@ class _DbCtx(threading.local):
 
     def init(self):
         logging.info('open lazy connection...')
-        self.connection = _LasyConnection()
+        # 获取连接对象
+        self.connection =  _LasyConnection()
         self.transactions = 0
 
     def cleanup(self):
         self.connection.cleanup()
         self.connection = None
-    # 保存数据库连接
+    # 返回游标对象
     def cursor(self):
         '''
         Return cursor
@@ -136,6 +140,9 @@ _db_ctx = _DbCtx()
 # global engine object:
 engine = None
 
+# 建立engine的目的在于创建一个connection pool。
+# 那么engine的变量需要是global变量。它一旦被创建，就是会被新建立的线程不断调用。
+# Engine就是一个封装好的connector
 class _Engine(object):
 
     def __init__(self, connect):
@@ -149,29 +156,36 @@ def create_engine(user, password, database, host='127.0.0.1', port=3306, **kw):
     global engine
     if engine is not None:
         raise DBError('Engine is already initialized.')
+    # 
     params = dict(user=user, password=password, database=database, host=host, port=port)
     defaults = dict(use_unicode=True, charset='utf8', collation='utf8_general_ci', autocommit=False)
     for k, v in defaults.iteritems():
-    	# kw.pop() ?? 删除键值对
+    	# **dic 关键参数,接收一个字段，包含了所有未出现在形式参数列表中的关键字参数
+        # kw.pop(k, v) 删除kw中以k为键的键值对，并返回v值
+        # 含有的defaults中的键值对，并往param中添加信息
         params[k] = kw.pop(k, v)
-    # 将kw添加到params中
-    params.update(kw)
+    # 将kw中剩余的键值对添加到params中
+    params.update(kw)   
     params['buffered'] = True
-    # 建立数据库连接  意义很重要！？？------
+    # mysql.connector.connect()接受数据库连接信息params，
+    # 返回数据库连接对象<class 'mysql.connector.connection.MySQLConnection'>
+    # 相当于一个数据库的connection pool
+    # 之后每次engine.connect()都返回了一个数据库连接
     engine = _Engine(lambda: mysql.connector.connect(**params))
     # test connection...
     logging.info('Init mysql engine <%s> ok.' % hex(id(engine)))
 
+# 管理、控制_db_ctx 间接控制connection对象
 class _ConnectionCtx(object):
     '''
-    _ConnectionCtx object that can open and close connection context. _ConnectionCtx object can be nested and only the most 
-    outer connection has effect.
+    _ConnectionCtx object that can open and close connection context. _ConnectionCtx object can be nested and only the most outer connection has effect.
 
     with connection():
         pass
         with connection():
             pass
     '''
+    # 建立连接
     def __enter__(self):
         global _db_ctx
         self.should_cleanup = False
@@ -179,7 +193,7 @@ class _ConnectionCtx(object):
             _db_ctx.init()
             self.should_cleanup = True
         return self
-
+    # 释放连接
     def __exit__(self, exctype, excvalue, traceback):
         global _db_ctx
         if self.should_cleanup:
@@ -194,6 +208,9 @@ def connection():
     '''
     return _ConnectionCtx()
 
+# 连接的装饰器
+# 实现上下文自动建立连接和释放连接  'with'
+# 省去了try...except...finally...操作
 def with_connection(func):
     '''
     Decorator for reuse connection.
@@ -204,8 +221,10 @@ def with_connection(func):
         f2()
         f3()
     '''
+    # 恢复func的原有属性
     @functools.wraps(func)
     def _wrapper(*args, **kw):
+        # 实现上下文自动建立连接和释放连接 
         with _ConnectionCtx():
             return func(*args, **kw)
     return _wrapper
@@ -323,8 +342,10 @@ def _select(sql, first, *args):
     sql = sql.replace('?', '%s')
     logging.info('SQL: %s, ARGS: %s' % (sql, args))
     try:
+        # 创建游标对象
         cursor = _db_ctx.connection.cursor()
         cursor.execute(sql, args)
+        print type(cursor.description)
         if cursor.description:
             names = [x[0] for x in cursor.description]
         if first:
@@ -422,12 +443,13 @@ def _update(sql, *args):
     sql = sql.replace('?', '%s')
     logging.info('SQL: %s, ARGS: %s' % (sql, args))
     try:
+        # 创建游标对象
         cursor = _db_ctx.connection.cursor()
         cursor.execute(sql, args)
         r = cursor.rowcount
         if _db_ctx.transactions==0:
             # no transaction enviroment:
-            logging.info('auto commit')
+            logging.info('auto commit') 
             _db_ctx.connection.commit()
         return r
     finally:
@@ -472,8 +494,6 @@ def update(sql, *args):
     u'michael@example.org'
     >>> u3.passwd
     u'654321'
-    >>> update('update user set passwd=? where id=?', '***', '123\' or id=\'456')
-    0
     '''
     return _update(sql, *args)
 
